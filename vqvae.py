@@ -1,3 +1,4 @@
+from functools import reduce
 import os
 import torch
 import torch.nn as nn
@@ -6,11 +7,13 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from tqdm import tqdm
 from torchvision.utils import save_image
+from layers import VQEmbedding
 
 batch_size = 100
 sample_freq = 5
 epoch = 50
 dim_z = 10
+vocab_size = 64
 
 train_dataset = datasets.MNIST(root='./mnist', train=True, transform=transforms.ToTensor(), download=True)
 test_dataset = datasets.MNIST(root='./mnist', train=False, transform=transforms.ToTensor(), download=True)
@@ -23,18 +26,13 @@ class Enc(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(dim_in, dim1)
         self.fc2 = nn.Linear(dim1, dim2)
-        self.fcz1 = nn.Linear(dim2, dim_z)
-        self.fcz2 = nn.Linear(dim2, dim_z)
+        self.fcz = nn.Linear(dim2, dim_z)
     def forward(self, x):
         x = x.view(-1, 28*28)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        mu, log_var = self.fcz1(x), self.fcz2(x)
-        return mu, log_var
-    def reparam(self, mu, log_var):
-        sigma = torch.exp(0.5 * log_var)
-        t = torch.randn_like(sigma)
-        return mu + t * sigma
+        z = self.fcz(x)
+        return z.view(-1, dim_z, 1, 1)
 
 class Dec(nn.Module):
     def __init__(self, dim_in, dim1, dim2, dim_z):
@@ -43,30 +41,29 @@ class Dec(nn.Module):
         self.fc2 = nn.Linear(dim2, dim1)
         self.fc3 = nn.Linear(dim1, dim_in)
     def forward(self, z):
+        z = z.view(-1, dim_z)
         x = F.relu(self.fc1(z))
         x = F.relu(self.fc2(x))
         x = F.sigmoid(self.fc3(x))
         return x.view(-1, 1, 28, 28)
 
-class VAE(nn.Module):
+class VQVAE(nn.Module):
     def __init__(self, dim_in, dim1, dim2, dim_z):
         super().__init__()
         self.encoder = Enc(dim_in, dim1, dim2, dim_z)
         self.decoder = Dec(dim_in, dim1, dim2, dim_z)
+        self.codebook = VQEmbedding(vocab_size, dim_z)
     def forward(self, x):
-        mu, log_var = self.encoder(x)
-        z = self.encoder.reparam(mu, log_var)
-        xp = self.decoder(z)
-        return xp, mu, log_var
+        z_e = self.encoder(x)
+        z_d_no_grad, z_d_with_grad = self.codebook.straight_through(z_e)
+        xp = self.decoder(z_d_no_grad)
+        return xp, z_e, z_d_with_grad
 
-def loss_func(x, xps, mu, log_var):
-    """
-    bce需要采样若干次z计算均值
-    """
-    bces = [F.binary_cross_entropy(xp, x, reduction='sum') for xp in xps]
-    bce = sum(bces) / len(bces)
-    kl = 0.5 * torch.sum(-log_var + mu**2 + torch.exp(log_var))
-    return bce + kl
+def loss_func(x, xp, z_e, z_d):
+    bce = F.binary_cross_entropy(xp, x, reduce='mean')
+    loss_vq = F.mse_loss(z_d, z_e.detach())
+    loss_commit = F.mse_loss(z_e, z_d.detach())
+    return bce + loss_vq + 0.25 * loss_commit
 
 def train_one_epoch(e, model, optimizer):
     model.train()
@@ -75,13 +72,11 @@ def train_one_epoch(e, model, optimizer):
         if torch.cuda.is_available():
             data = data.cuda()
         optimizer.zero_grad()
-        mu, log_var = model.encoder(data)
-        zs = [model.encoder.reparam(mu, log_var) for _ in range(sample_freq)]
-        xps = [model.decoder(z) for z in zs]
-        loss = loss_func(data, xps, mu, log_var) / data.size(0)
+        xp, z_e, z_d = model(data)
+        loss = loss_func(data, xp, z_e, z_d)
         loss.backward()
         optimizer.step()
-        pbar.set_description("epoch {} train loss: {:.2f}".format(e, loss.item()))
+        pbar.set_description("epoch {} train loss: {:.9f}".format(e, loss.item()))
 
 def test_one_epoch(e, model):
     model.eval()
@@ -91,17 +86,13 @@ def test_one_epoch(e, model):
         for data, _ in pbar:
             if torch.cuda.is_available():
                 data = data.cuda()
-            mu, log_var = model.encoder(data)
-            zs = [model.encoder.reparam(mu, log_var) for _ in range(sample_freq)]
-            xps = [model.decoder(z) for z in zs]
-            loss = loss_func(data, xps, mu, log_var).item()
-            total_loss += loss
-            pbar.set_description("epoch {} test loss: {:.2f}".format(e, loss / data.size(0)))
-    print('test average loss: {:.2f}'.format(total_loss / len(test_loader.dataset)))
+            xp, z_e, z_d = model(data)
+            loss = loss_func(data, xp, z_e, z_d).item()
+            pbar.set_description("epoch {} test loss: {:.9f}".format(e, loss))
 
 def sampling(e, model):
     model.eval()
-    z = torch.randn(64, dim_z)
+    z = model.codebook.embedding.weight
     if torch.cuda.is_available():
         z = z.cuda()
     with torch.no_grad():
@@ -112,7 +103,7 @@ def sampling(e, model):
         save_image(sample, './samples/sample_{}'.format(e) + '.png')
 
 if __name__ == '__main__':
-    model = VAE(28*28, 256, 128, dim_z)
+    model = VQVAE(28*28, 256, 128, dim_z)
     if torch.cuda.is_available():
         model = model.cuda()
     optimizer = optim.Adam(model.parameters())
